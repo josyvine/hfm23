@@ -180,22 +180,34 @@ public class MediaPickerActivity extends Activity {
                     return foundFiles; // Return empty for unknown category
             }
 
-            Cursor cursor = contentResolver.query(queryUri, projection, selection, selectionArgs, MediaStore.MediaColumns.DATE_MODIFIED + " DESC");
+            // FIX: Pass null for sortOrder to bypass OPPO/ColorOS/Vivo/Xiaomi SQL view parser bugs
+            Cursor cursor = contentResolver.query(queryUri, projection, selection, selectionArgs, null);
 
             if (cursor != null) {
                 try {
                     int dataColumnIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA);
                     while (cursor.moveToNext()) {
                         String path = cursor.getString(dataColumnIndex);
-                        File file = new File(path);
-                        if (file.exists() && file.length() > 0) { // Check if file exists and is not empty
-                            foundFiles.add(file);
+                        if (path != null) {
+                            File file = new File(path);
+                            if (file.exists() && file.length() > 0) { // Check if file exists and is not empty
+                                foundFiles.add(file);
+                            }
                         }
                     }
                 } finally {
                     cursor.close();
                 }
             }
+
+            // Sort 100% in Java memory (OPPO / ColorOS safe)
+            Collections.sort(foundFiles, new Comparator<File>() {
+                @Override
+                public int compare(File f1, File f2) {
+                    return Long.compare(f2.lastModified(), f1.lastModified());
+                }
+            });
+
             return foundFiles;
         }
 
@@ -221,4 +233,3 @@ public class MediaPickerActivity extends Activity {
         }
     }
 }
-
