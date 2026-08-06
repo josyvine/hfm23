@@ -71,6 +71,7 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -106,6 +107,7 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
     private static final int CATEGORY_OTHER = 5;
 
     private final ExecutorService searchExecutor = Executors.newSingleThreadExecutor();
+    private Future<?> currentSearchFuture = null; // Thread Immunity: Task reference to control cancellations
 
     private static final Pattern FILE_BASE_NAME_PATTERN = Pattern.compile("^(IMG|VID|PANO|DSC)_\\d{8}_\\d{6}");
 
@@ -276,8 +278,13 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
         });
     }
 
-    private void executeQuery(final String query) {
-        searchExecutor.execute(new Runnable() {
+    private synchronized void executeQuery(final String query) {
+        // Mechanism 1: Cancel any previously active background query task before submitting a new request
+        if (currentSearchFuture != null) {
+            currentSearchFuture.cancel(true);
+        }
+
+        currentSearchFuture = searchExecutor.submit(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -296,11 +303,16 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
                         List<SearchResult> fileSystemResults = performFallbackFileSearch(params);
                         updateUIWithResults(fileSystemResults);
                     }
-                } catch (Exception e) {
-                    Log.e(TAG, "Search query execution failed, switching to deep scan fallback", e);
-                    final QueryParameters params = parseQuery(query);
-                    List<SearchResult> fileSystemResults = performFallbackFileSearch(params);
-                    updateUIWithResults(fileSystemResults);
+                } catch (Throwable t) {
+                    // Catch-all block ensures that exceptions (SecurityException, SQLite exception, etc.) never terminate the worker thread.
+                    Log.e(TAG, "Search query background execution encountered an exception. Bypassing safely.", t);
+                    try {
+                        final QueryParameters params = parseQuery(query);
+                        List<SearchResult> fileSystemResults = performFallbackFileSearch(params);
+                        updateUIWithResults(fileSystemResults);
+                    } catch (Throwable fallbackEx) {
+                        Log.e(TAG, "Search query disk fallback failed completely.", fallbackEx);
+                    }
                 }
             }
         });
@@ -311,6 +323,7 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                // Do not wipe UI until the new processed list is safely computed and ready to display
                 masterList.clear();
                 masterList.addAll(groupedList);
                 rebuildDisplayList();
@@ -383,6 +396,19 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
                 masterResults.addAll(querySingleUriSafely(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, params, MediaStore.Files.FileColumns.MEDIA_TYPE_AUDIO, processedPaths));
             } else {
                 masterResults.addAll(querySingleUriSafely(MediaStore.Files.getContentUri("external"), params, -1, processedPaths));
+            }
+
+            // Mechanism 2 Fail-Safe Switch: If MediaStore returns empty or sparse results for non-media categories,
+            // we trigger our seamless fallback filesystem scan.
+            boolean isNonMediaCategory = "documents".equals(currentFilterType) || "archives".equals(currentFilterType) || "other".equals(currentFilterType);
+            if (isNonMediaCategory && masterResults.size() < 3) {
+                List<SearchResult> diskResults = performFallbackFileSearch(params);
+                for (SearchResult diskFile : diskResults) {
+                    if (diskFile.getPath() != null && !processedPaths.contains(diskFile.getPath())) {
+                        processedPaths.add(diskFile.getPath());
+                        masterResults.add(diskFile);
+                    }
+                }
             }
 
             // Universal App-Side Java Sorting (Completely OEM-Agnostic)
@@ -464,9 +490,10 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
                         continue; // Skip ghost entries that no longer exist on disk
                     }
 
+                    // Mechanism 3 Fallback: Default to file lastModified timestamp if MediaStore timestamp returns null/0
                     long lastModifiedMillis = dateModifiedSeconds * 1000;
                     long filesystemDate = actualFile.lastModified();
-                    if (filesystemDate > lastModifiedMillis) {
+                    if (lastModifiedMillis <= 0 || filesystemDate > lastModifiedMillis) {
                         lastModifiedMillis = filesystemDate;
                     }
 
@@ -540,7 +567,7 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
 
     private void scanDirectory(File directory, QueryParameters params, List<SearchResult> results) {
         if (directory.getName().equalsIgnoreCase("HFMRecycleBin")) {
-            return; // Never scan Recycle Bin contents in search
+            return; // Recycle Bin skip preservation
         }
 
         File[] files = directory.listFiles();
