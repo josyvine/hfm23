@@ -362,7 +362,7 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
 
     /**
      * UNIVERSAL MASTER ENGINE: 100% Compatible with ALL Android Brands (OPPO, Vivo, Xiaomi, Samsung, Huawei, Pixel).
-     * Bypasses OEM MediaStore bugs by querying 4 distinct system URIs, validating physical file timestamps,
+     * Bypasses OEM MediaStore bugs by querying distinct system URIs, validating physical file timestamps,
      * merging Dual-App paths (/storage/emulated/999/), and sorting 100% inside Java RAM.
      */
     private List<MassDeleteAdapter.SearchResult> executeQueryWithMediaStore(QueryParameters params) {
@@ -447,20 +447,36 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
                 selectionArgs.add("%" + params.folderPath + "%");
             }
 
-            String[] projection = {
-                MediaStore.Files.FileColumns._ID,
-                MediaStore.Files.FileColumns.MEDIA_TYPE,
-                MediaStore.Files.FileColumns.DATE_MODIFIED,
-                MediaStore.Files.FileColumns.DISPLAY_NAME,
-                MediaStore.Files.FileColumns.DATA
-            };
+            // DYNAMIC PROJECTION FIX:
+            // MediaStore.Files.FileColumns.MEDIA_TYPE ("media_type") only exists on the generic "files" table.
+            // Querying "media_type" on isolated tables (images, video, audio) causes SQLiteException on OPPO
+            // and IllegalArgumentException on Huawei.
+            boolean isGenericFilesUri = MediaStore.Files.getContentUri("external").equals(queryUri);
+
+            String[] projection;
+            if (isGenericFilesUri) {
+                projection = new String[]{
+                    MediaStore.Files.FileColumns._ID,
+                    MediaStore.Files.FileColumns.MEDIA_TYPE,
+                    MediaStore.Files.FileColumns.DATE_MODIFIED,
+                    MediaStore.Files.FileColumns.DISPLAY_NAME,
+                    MediaStore.Files.FileColumns.DATA
+                };
+            } else {
+                projection = new String[]{
+                    MediaStore.Files.FileColumns._ID,
+                    MediaStore.Files.FileColumns.DATE_MODIFIED,
+                    MediaStore.Files.FileColumns.DISPLAY_NAME,
+                    MediaStore.Files.FileColumns.DATA
+                };
+            }
 
             // Pass null as sortOrder to avoid OPPO/Vivo/ColorOS SQL query parser crash
             cursor = getContentResolver().query(queryUri, projection, selection.toString(), selectionArgs.toArray(new String[0]), null);
 
             if (cursor != null) {
                 int idColumn = cursor.getColumnIndex(MediaStore.Files.FileColumns._ID);
-                int mediaTypeColumn = cursor.getColumnIndex(MediaStore.Files.FileColumns.MEDIA_TYPE);
+                int mediaTypeColumn = isGenericFilesUri ? cursor.getColumnIndex(MediaStore.Files.FileColumns.MEDIA_TYPE) : -1;
                 int displayNameColumn = cursor.getColumnIndex(MediaStore.Files.FileColumns.DISPLAY_NAME);
                 int dateModifiedColumn = cursor.getColumnIndex(MediaStore.Files.FileColumns.DATE_MODIFIED);
                 int dataColumn = cursor.getColumnIndex(MediaStore.Files.FileColumns.DATA);
