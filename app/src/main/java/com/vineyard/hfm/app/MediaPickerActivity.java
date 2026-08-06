@@ -7,7 +7,9 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.AsyncTask;
 import android.os.Bundle;
+import android.os.Environment;
 import android.provider.MediaStore;
+import android.util.Log;
 import android.view.View;
 import android.widget.Button;
 import android.widget.ImageButton;
@@ -18,9 +20,13 @@ import androidx.recyclerview.widget.GridLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
 public class MediaPickerActivity extends Activity {
 
@@ -34,6 +40,7 @@ public class MediaPickerActivity extends Activity {
     private MediaPickerAdapter adapter;
     private List<File> mediaFileList = new ArrayList<>();
     private String categoryType;
+    private ScanMediaTask mScanTask; // Task reference for cancellation control
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -54,7 +61,8 @@ public class MediaPickerActivity extends Activity {
         setupListeners();
         updateTitle();
 
-        new ScanMediaTask().execute(categoryType);
+        mScanTask = new ScanMediaTask();
+        mScanTask.execute(categoryType);
     }
 
     private void initializeViews() {
@@ -135,6 +143,14 @@ public class MediaPickerActivity extends Activity {
         selectionCountTextView.setText(count + " files selected");
     }
 
+    @Override
+    protected void onDestroy() {
+        if (mScanTask != null) {
+            mScanTask.cancel(true);
+        }
+        super.onDestroy();
+    }
+
     private class ScanMediaTask extends AsyncTask<String, Void, List<File>> {
 
         @Override
@@ -180,24 +196,80 @@ public class MediaPickerActivity extends Activity {
                     return foundFiles; // Return empty for unknown category
             }
 
-            // FIX: Pass null for sortOrder to bypass OPPO/ColorOS/Vivo/Xiaomi SQL view parser bugs
-            Cursor cursor = contentResolver.query(queryUri, projection, selection, selectionArgs, null);
+            try {
+                // FIX: Pass null for sortOrder to bypass OPPO/ColorOS/Vivo/Xiaomi SQL view parser bugs
+                Cursor cursor = contentResolver.query(queryUri, projection, selection, selectionArgs, null);
 
-            if (cursor != null) {
-                try {
-                    int dataColumnIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA);
-                    while (cursor.moveToNext()) {
-                        String path = cursor.getString(dataColumnIndex);
-                        if (path != null) {
-                            File file = new File(path);
-                            if (file.exists() && file.length() > 0) { // Check if file exists and is not empty
-                                foundFiles.add(file);
+                if (cursor != null) {
+                    try {
+                        int dataColumnIndex = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA);
+                        while (cursor.moveToNext()) {
+                            if (isCancelled()) {
+                                break;
+                            }
+                            String path = cursor.getString(dataColumnIndex);
+                            if (path != null) {
+                                File file = new File(path);
+                                if (file.exists() && file.length() > 0) { // Check if file exists and is not empty
+                                    foundFiles.add(file);
+                                }
                             }
                         }
+                    } finally {
+                        cursor.close();
                     }
-                } finally {
-                    cursor.close();
                 }
+
+                // Mechanism 2 Fall-Safe Switch: If MediaStore query returns sparse or empty records, 
+                // perform a fallback manual filesystem sweep of key storage roots.
+                if (foundFiles.size() < 3) {
+                    List<File> diskFallbackResults = new ArrayList<>();
+                    File externalStorage = Environment.getExternalStorageDirectory();
+
+                    List<File> rootsToScan = new ArrayList<>();
+                    rootsToScan.add(new File(externalStorage, "WhatsApp"));
+                    rootsToScan.add(new File(externalStorage, "Android/media/com.whatsapp/WhatsApp"));
+                    rootsToScan.add(new File(externalStorage, "Download"));
+                    rootsToScan.add(new File(externalStorage, "Telegram"));
+                    rootsToScan.add(new File(externalStorage, "DCIM"));
+                    rootsToScan.add(new File(externalStorage, "Pictures"));
+                    rootsToScan.add(new File(externalStorage, "DCIM/Camera"));
+
+                    File dualAppStorage = new File("/storage/emulated/999");
+                    if (dualAppStorage.exists() && dualAppStorage.canRead()) {
+                         rootsToScan.add(new File(dualAppStorage, "WhatsApp"));
+                         rootsToScan.add(new File(dualAppStorage, "Android/media/com.whatsapp/WhatsApp"));
+                         rootsToScan.add(new File(dualAppStorage, "DCIM"));
+                         rootsToScan.add(new File(dualAppStorage, "Download"));
+                    }
+
+                    File parallelAppStorage = new File("/storage/emulated/10");
+                    if (parallelAppStorage.exists() && parallelAppStorage.canRead()) {
+                         rootsToScan.add(new File(parallelAppStorage, "WhatsApp"));
+                         rootsToScan.add(new File(parallelAppStorage, "DCIM"));
+                    }
+
+                    for (File root : rootsToScan) {
+                        if (root.exists() && root.isDirectory()) {
+                            scanDirectoryFallback(root, category, diskFallbackResults);
+                        }
+                    }
+
+                    Set<String> matchedPaths = new HashSet<>();
+                    for (File file : foundFiles) {
+                        matchedPaths.add(file.getAbsolutePath());
+                    }
+
+                    for (File fallbackFile : diskFallbackResults) {
+                        if (!matchedPaths.contains(fallbackFile.getAbsolutePath())) {
+                            foundFiles.add(fallbackFile);
+                        }
+                    }
+                }
+
+            } catch (Throwable t) {
+                // Catch-all block ensures database exception thrown on ColorOS never terminates the background thread.
+                Log.e("MediaPickerActivity", "ScanMediaTask background execution encountered an exception. Bypassing safely.", t);
             }
 
             // Sort 100% in Java memory (OPPO / ColorOS safe)
@@ -209,6 +281,54 @@ public class MediaPickerActivity extends Activity {
             });
 
             return foundFiles;
+        }
+
+        private void scanDirectoryFallback(File directory, String category, List<File> outList) {
+            if (directory == null || !directory.exists() || !directory.isDirectory()) {
+                return;
+            }
+            if (directory.getName().equalsIgnoreCase("HFMRecycleBin")) {
+                return; // Recycle Bin exclusion preservation
+            }
+            File[] files = directory.listFiles();
+            if (files == null) return;
+            for (File file : files) {
+                if (isCancelled()) {
+                    break;
+                }
+                if (file.isDirectory()) {
+                    if (!file.getName().startsWith(".") && !file.getName().equalsIgnoreCase("Android")) {
+                        scanDirectoryFallback(file, category, outList);
+                    }
+                } else {
+                    if (file.getName().startsWith(".")) continue;
+                    if (isCategoryMatch(file.getName(), category)) {
+                        if (file.exists() && file.length() > 0) {
+                            outList.add(file);
+                        }
+                    }
+                }
+            }
+        }
+
+        private boolean isCategoryMatch(String filename, String category) {
+            String ext = "";
+            int dotIdx = filename.lastIndexOf('.');
+            if (dotIdx > 0) {
+                ext = filename.substring(dotIdx + 1).toLowerCase(Locale.ROOT);
+            }
+            switch (category) {
+                case CategoryPickerActivity.CATEGORY_VIDEOS:
+                    return Arrays.asList("mp4", "3gp", "mkv", "webm", "avi", "mov").contains(ext);
+                case CategoryPickerActivity.CATEGORY_IMAGES:
+                    return Arrays.asList("jpg", "jpeg", "png", "gif", "bmp", "webp").contains(ext);
+                case CategoryPickerActivity.CATEGORY_AUDIO:
+                    return Arrays.asList("mp3", "wav", "ogg", "m4a", "aac", "flac").contains(ext);
+                case CategoryPickerActivity.CATEGORY_DOCUMENTS:
+                    return Arrays.asList("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "html").contains(ext);
+                default:
+                    return false;
+            }
         }
 
         @Override
