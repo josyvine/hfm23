@@ -69,6 +69,7 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -104,6 +105,8 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
     private static final int CATEGORY_OTHER = 5;
 
     private final ExecutorService searchExecutor = Executors.newSingleThreadExecutor();
+    private Future<?> currentSearchFuture = null; // Thread Immunity: Task reference to control cancellations
+
     private static final Pattern FILE_BASE_NAME_PATTERN = Pattern.compile("^(IMG|VID|PANO|DSC)_\\d{8}_\\d{6}");
 
     private List<MassDeleteAdapter.SearchResult> mResultsPendingPermission;
@@ -243,8 +246,13 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
         });
     }
 
-    private void executeQuery(final String query) {
-        searchExecutor.execute(new Runnable() {
+    private synchronized void executeQuery(final String query) {
+        // Mechanism 1: Cancel any previously active background query task before submitting a new request
+        if (currentSearchFuture != null) {
+            currentSearchFuture.cancel(true);
+        }
+
+        currentSearchFuture = searchExecutor.submit(new Runnable() {
             @Override
             public void run() {
                 try {
@@ -263,11 +271,16 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
                         List<MassDeleteAdapter.SearchResult> fileSystemResults = performFallbackFileSearch(params);
                         updateUIWithResults(fileSystemResults, params);
                     }
-                } catch (Exception e) {
-                    Log.e(TAG, "Search query execution failed, switching to deep scan fallback", e);
-                    final QueryParameters params = parseQuery(query);
-                    List<MassDeleteAdapter.SearchResult> fileSystemResults = performFallbackFileSearch(params);
-                    updateUIWithResults(fileSystemResults, params);
+                } catch (Throwable t) {
+                    // Catch-all block ensures database exception thrown on ColorOS never terminates the background thread.
+                    Log.e(TAG, "Search query background execution encountered an exception. Bypassing safely.", t);
+                    try {
+                        final QueryParameters params = parseQuery(query);
+                        List<MassDeleteAdapter.SearchResult> fileSystemResults = performFallbackFileSearch(params);
+                        updateUIWithResults(fileSystemResults, params);
+                    } catch (Throwable fallbackEx) {
+                        Log.e(TAG, "Search query disk fallback failed completely.", fallbackEx);
+                    }
                 }
             }
         });
@@ -278,6 +291,7 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                // Do not wipe UI until the new processed list is safely computed and ready to display
                 masterList.clear();
                 masterList.addAll(groupedList);
 
@@ -368,12 +382,25 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
                 masterResults.addAll(querySingleUriForMassDelete(MediaStore.Files.getContentUri("external"), params, -1, processedPaths));
             }
 
-            // Fallback Deep Disk Scan for Dual Apps (/storage/emulated/999/) and Unindexed Documents
-            List<MassDeleteAdapter.SearchResult> diskFallbackResults = performFallbackFileSearch(params);
-            for (MassDeleteAdapter.SearchResult fallbackItem : diskFallbackResults) {
-                if (fallbackItem.getPath() != null && !processedPaths.contains(fallbackItem.getPath())) {
-                    processedPaths.add(fallbackItem.getPath());
-                    masterResults.add(fallbackItem);
+            // Mechanism 2 Fail-Safe Switch: If MediaStore returns empty or sparse results for non-media categories,
+            // we trigger our seamless fallback filesystem scan.
+            boolean isNonMediaCategory = "documents".equals(currentFilterType) || "archives".equals(currentFilterType) || "other".equals(currentFilterType);
+            if (isNonMediaCategory && masterResults.size() < 3) {
+                List<MassDeleteAdapter.SearchResult> diskFallbackResults = performFallbackFileSearch(params);
+                for (MassDeleteAdapter.SearchResult fallbackItem : diskFallbackResults) {
+                    if (fallbackItem.getPath() != null && !processedPaths.contains(fallbackItem.getPath())) {
+                        processedPaths.add(fallbackItem.getPath());
+                        masterResults.add(fallbackItem);
+                    }
+                }
+            } else {
+                // Fallback Deep Disk Scan for Dual Apps (/storage/emulated/999/) and Unindexed Documents
+                List<MassDeleteAdapter.SearchResult> diskFallbackResults = performFallbackFileSearch(params);
+                for (MassDeleteAdapter.SearchResult fallbackItem : diskFallbackResults) {
+                    if (fallbackItem.getPath() != null && !processedPaths.contains(fallbackItem.getPath())) {
+                        processedPaths.add(fallbackItem.getPath());
+                        masterResults.add(fallbackItem);
+                    }
                 }
             }
 
@@ -449,6 +476,7 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
                         continue; // Skip ghost entries that no longer exist on disk
                     }
 
+                    // Mechanism 3 Fallback: Default to file lastModified timestamp if MediaStore timestamp returns null/0
                     long finalTimestampMillis = dbDateModifiedSeconds * 1000;
                     long fileSystemMillis = actualFile.lastModified();
 
@@ -526,7 +554,7 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
 
     private void scanDirectory(File directory, QueryParameters params, List<MassDeleteAdapter.SearchResult> results) {
         if (directory.getName().equalsIgnoreCase("HFMRecycleBin")) {
-            return;
+            return; // Recycle Bin skip preservation
         }
 
         File[] files = directory.listFiles();
@@ -1260,6 +1288,9 @@ public class MassDeleteActivity extends Activity implements MassDeleteAdapter.On
         }
         if (compressionBroadcastReceiver != null) {
             LocalBroadcastManager.getInstance(this).unregisterReceiver(compressionBroadcastReceiver);
+        }
+        if (currentSearchFuture != null) {
+            currentSearchFuture.cancel(true);
         }
         super.onDestroy();
     }
