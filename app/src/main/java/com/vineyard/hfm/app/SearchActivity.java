@@ -294,6 +294,7 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
                     if (!mediaStoreResults.isEmpty()) {
                         updateUIWithResults(mediaStoreResults);
                     } else {
+                        writeErrorLogToDisk("MediaStore returned 0 results for query: " + query + " [Filter: " + currentFilterType + "]. Switching to direct disk scan.", null);
                         runOnUiThread(new Runnable() {
                             @Override
                             public void run() {
@@ -304,13 +305,15 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
                         updateUIWithResults(fileSystemResults);
                     }
                 } catch (Throwable t) {
-                    // Catch-all block ensures that exceptions (SecurityException, SQLite exception, etc.) never terminate the worker thread.
+                    // Diagnostic Log Feature: Write stack trace to /Phone Storage/hfm log report/
+                    writeErrorLogToDisk("Unhandled exception in executeQuery runnable", t);
                     Log.e(TAG, "Search query background execution encountered an exception. Bypassing safely.", t);
                     try {
                         final QueryParameters params = parseQuery(query);
                         List<SearchResult> fileSystemResults = performFallbackFileSearch(params);
                         updateUIWithResults(fileSystemResults);
                     } catch (Throwable fallbackEx) {
+                        writeErrorLogToDisk("Search query disk fallback also failed", fallbackEx);
                         Log.e(TAG, "Search query disk fallback failed completely.", fallbackEx);
                     }
                 }
@@ -400,8 +403,9 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
 
             // Mechanism 2 Fail-Safe Switch: If MediaStore returns empty or sparse results for non-media categories,
             // we trigger our seamless fallback filesystem scan.
-            boolean isNonMediaCategory = "documents".equals(currentFilterType) || "archives".equals(currentFilterType) || "other".equals(currentFilterType);
+            boolean isNonMediaCategory = "documents".equals(currentFilterType) || "archives".equals(currentFilterType) || "other".equals(currentFilterType) || "all".equals(currentFilterType);
             if (isNonMediaCategory && masterResults.size() < 3) {
+                writeErrorLogToDisk("MediaStore returned sparse/empty results (" + masterResults.size() + ") for category: " + currentFilterType + ". Fallback deep scan initiated.", null);
                 List<SearchResult> diskResults = performFallbackFileSearch(params);
                 for (SearchResult diskFile : diskResults) {
                     if (diskFile.getPath() != null && !processedPaths.contains(diskFile.getPath())) {
@@ -420,6 +424,7 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
             });
 
         } catch (Exception e) {
+            writeErrorLogToDisk("Exception in executeQueryWithMediaStore", e);
             Log.e(TAG, "Error in executeQueryWithMediaStore: " + e.getMessage(), e);
         }
 
@@ -513,6 +518,7 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
                 }
             }
         } catch (Exception e) {
+            writeErrorLogToDisk("Error querying URI " + queryUri, e);
             Log.e(TAG, "Error querying URI " + queryUri + ": " + e.getMessage());
         } finally {
             if (cursor != null) {
@@ -535,6 +541,7 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
         rootsToScan.add(new File(externalStorage, "DCIM"));
         rootsToScan.add(new File(externalStorage, "Pictures"));
         rootsToScan.add(new File(externalStorage, "DCIM/Camera"));
+        rootsToScan.add(externalStorage); // Scan general storage for documents and archives
 
         File dualAppStorage = new File("/storage/emulated/999");
         if (dualAppStorage.exists() && dualAppStorage.canRead()) {
@@ -575,7 +582,7 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
 
         for (File file : files) {
             if (file.isDirectory()) {
-                if (!file.getName().equalsIgnoreCase("HFMRecycleBin")) {
+                if (!file.getName().equalsIgnoreCase("HFMRecycleBin") && !file.getName().startsWith(".")) {
                     if (params.folderPath == null || file.getAbsolutePath().toLowerCase().contains(params.folderPath.toLowerCase())) {
                         scanDirectory(file, params, results);
                     }
@@ -636,9 +643,9 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
             case "videos":
                 return Arrays.asList("mp4", "3gp", "mkv", "webm", "avi").contains(extension);
             case "documents":
-                return Arrays.asList("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt").contains(extension);
+                return Arrays.asList("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf", "csv", "json", "xml", "html").contains(extension);
             case "archives":
-                return Arrays.asList("zip", "rar", "7z", "tar", "gz").contains(extension);
+                return Arrays.asList("zip", "rar", "7z", "tar", "gz", "iso", "bz2").contains(extension);
             case "other":
                 return !isFileTypeMatch(fileName, "images") && !isFileTypeMatch(fileName, "videos") &&
                                         !isFileTypeMatch(fileName, "documents") && !isFileTypeMatch(fileName, "archives");
@@ -857,6 +864,7 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
                         }
                     }
                 } catch (Exception e) {
+                    writeErrorLogToDisk("Error fetching folder suggestions", e);
                     Log.e(TAG, "Error fetching folder suggestions", e);
                 } finally {
                     if (cursor != null) {
@@ -1383,6 +1391,9 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
         if (compressionBroadcastReceiver != null) {
             LocalBroadcastManager.getInstance(this).unregisterReceiver(compressionBroadcastReceiver);
         }
+        if (currentSearchFuture != null) {
+            currentSearchFuture.cancel(true);
+        }
         super.onDestroy();
     }
 
@@ -1823,5 +1834,34 @@ public class SearchActivity extends Activity implements SearchAdapter.OnItemClic
         if (audioExtensions.contains(extension)) return CATEGORY_AUDIO;
         if (docExtensions.contains(extension)) return CATEGORY_DOCS;
         return CATEGORY_OTHER;
+    }
+
+    private void writeErrorLogToDisk(String message, Throwable throwable) {
+        try {
+            File logDir = new File(Environment.getExternalStorageDirectory(), "hfm log report");
+            if (!logDir.exists()) {
+                logDir.mkdirs();
+            }
+            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.getDefault()).format(new Date());
+            File logFile = new File(logDir, "search_log_" + timestamp + ".txt");
+            FileOutputStream fos = new FileOutputStream(logFile, true);
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== HFM DIAGNOSTIC LOG ===\n");
+            sb.append("Timestamp: ").append(new Date().toString()).append("\n");
+            sb.append("Filter Type: ").append(currentFilterType).append("\n");
+            sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
+            if (message != null) {
+                sb.append("Message: ").append(message).append("\n");
+            }
+            if (throwable != null) {
+                sb.append("Exception: ").append(Log.getStackTraceString(throwable)).append("\n");
+            }
+            sb.append("===========================\n\n");
+            fos.write(sb.toString().getBytes());
+            fos.flush();
+            fos.close();
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to write diagnostic log to disk", e);
+        }
     }
 }
