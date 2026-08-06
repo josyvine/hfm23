@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.AsyncTask;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.provider.MediaStore;
@@ -19,10 +20,13 @@ import android.widget.Toast;
 import androidx.recyclerview.widget.GridLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 import java.io.File;
+import java.io.FileOutputStream;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -223,6 +227,7 @@ public class MediaPickerActivity extends Activity {
                 // Mechanism 2 Fall-Safe Switch: If MediaStore query returns sparse or empty records, 
                 // perform a fallback manual filesystem sweep of key storage roots.
                 if (foundFiles.size() < 3) {
+                    writeErrorLogToDisk("MediaStore query returned sparse/empty records (" + foundFiles.size() + ") for category: " + category + ". Initiating disk fallback.", null);
                     List<File> diskFallbackResults = new ArrayList<>();
                     File externalStorage = Environment.getExternalStorageDirectory();
 
@@ -234,6 +239,7 @@ public class MediaPickerActivity extends Activity {
                     rootsToScan.add(new File(externalStorage, "DCIM"));
                     rootsToScan.add(new File(externalStorage, "Pictures"));
                     rootsToScan.add(new File(externalStorage, "DCIM/Camera"));
+                    rootsToScan.add(externalStorage); // Direct storage fallback
 
                     File dualAppStorage = new File("/storage/emulated/999");
                     if (dualAppStorage.exists() && dualAppStorage.canRead()) {
@@ -269,6 +275,7 @@ public class MediaPickerActivity extends Activity {
 
             } catch (Throwable t) {
                 // Catch-all block ensures database exception thrown on ColorOS never terminates the background thread.
+                writeErrorLogToDisk("ScanMediaTask background execution encountered an exception", t);
                 Log.e("MediaPickerActivity", "ScanMediaTask background execution encountered an exception. Bypassing safely.", t);
             }
 
@@ -297,7 +304,7 @@ public class MediaPickerActivity extends Activity {
                     break;
                 }
                 if (file.isDirectory()) {
-                    if (!file.getName().startsWith(".") && !file.getName().equalsIgnoreCase("Android")) {
+                    if (!file.getName().startsWith(".") && !file.getName().equalsIgnoreCase("Android") && !file.getName().equalsIgnoreCase("HFMRecycleBin")) {
                         scanDirectoryFallback(file, category, outList);
                     }
                 } else {
@@ -325,7 +332,7 @@ public class MediaPickerActivity extends Activity {
                 case CategoryPickerActivity.CATEGORY_AUDIO:
                     return Arrays.asList("mp3", "wav", "ogg", "m4a", "aac", "flac").contains(ext);
                 case CategoryPickerActivity.CATEGORY_DOCUMENTS:
-                    return Arrays.asList("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "html").contains(ext);
+                    return Arrays.asList("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "html", "rtf").contains(ext);
                 default:
                     return false;
             }
@@ -350,6 +357,35 @@ public class MediaPickerActivity extends Activity {
 					});
                 mediaRecyclerView.setAdapter(adapter);
             }
+        }
+    }
+
+    private void writeErrorLogToDisk(String message, Throwable throwable) {
+        try {
+            File logDir = new File(Environment.getExternalStorageDirectory(), "hfm log report");
+            if (!logDir.exists()) {
+                logDir.mkdirs();
+            }
+            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.getDefault()).format(new Date());
+            File logFile = new File(logDir, "media_picker_log_" + timestamp + ".txt");
+            FileOutputStream fos = new FileOutputStream(logFile, true);
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== HFM DIAGNOSTIC LOG (MediaPicker) ===\n");
+            sb.append("Timestamp: ").append(new Date().toString()).append("\n");
+            sb.append("Category Type: ").append(categoryType).append("\n");
+            sb.append("Device: ").append(Build.MANUFACTURER).append(" ").append(Build.MODEL).append("\n");
+            if (message != null) {
+                sb.append("Message: ").append(message).append("\n");
+            }
+            if (throwable != null) {
+                sb.append("Exception: ").append(Log.getStackTraceString(throwable)).append("\n");
+            }
+            sb.append("=========================================\n\n");
+            fos.write(sb.toString().getBytes());
+            fos.flush();
+            fos.close();
+        } catch (Exception e) {
+            Log.e("MediaPickerActivity", "Failed to write diagnostic log to disk", e);
         }
     }
 }
